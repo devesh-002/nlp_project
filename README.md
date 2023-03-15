@@ -27,3 +27,4 @@ bash eval.sh
 We also have submitted the model [here](https://iiitaphyd-my.sharepoint.com/:f:/g/personal/devesh_marwah_research_iiit_ac_in/EojD7orR1MVCkRrnJyuW6qMBhlWvWWeWaDz6bIop9_5VSA?e=UZmOAc) 
 
 The current model is pretrained on vanilla transformer on sentence ordering task for vanilla transformers.
+The logs for running the model have also been attached here.
