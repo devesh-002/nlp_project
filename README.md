@@ -13,11 +13,11 @@ The metrics are as follows:
 - `arch` can take one of vanilla, hierarchical
 - `task` can take one of 3-way-classification, minority-classification,sentence-ordering or sentence-score-prediction for GCDC dataset and only sentence-ordering for WSJ dataset
 - `model_name` defines transformer model to use. (by-default its's roberta-base)
-
+For training custom model
 ```
 bash try.sh
 ```
-
+To make changes to try.sh file
 ```
 python3 main.py --arch <arch_name> --corpus <corpus_name>   --task <task_name>
 ```
@@ -32,7 +32,4 @@ To make changes in inferences:
 python3 main.py --sub_corpus <name if gcdc> --inference --arch <arch_name>  --corpus <dataset_name>  --freeze_emb_layer  --task <task_name>  --checkpoint_path <saved_checkpoint_path>
 
 ```
-We also have submitted the model [here](https://iiitaphyd-my.sharepoint.com/:f:/g/personal/devesh_marwah_research_iiit_ac_in/EojD7orR1MVCkRrnJyuW6qMBhlWvWWeWaDz6bIop9_5VSA?e=UZmOAc) 
-
-The current model is pretrained on vanilla transformer on sentence ordering task for vanilla transformers.
-The logs for running the model have also been attached here.
+We also have submitted the models [here](https://iiitaphyd-my.sharepoint.com/:f:/g/personal/devesh_marwah_research_iiit_ac_in/EojD7orR1MVCkRrnJyuW6qMBhlWvWWeWaDz6bIop9_5VSA?e=UZmOAc) 
