@@ -18,7 +18,7 @@ from models import *
 from pytorch_lightning.loggers import WandbLogger
 import sys
 from pytorch_lightning.utilities import rank_zero_only
-from dataset_processor.featurize_dataset import GCDCFeaturizer, WSJFeaturizer
+from dataset_processor.featurize_dataset import GCDCFeaturizer, WSJFeaturizer, MTLFeaturizer,DanishFeautrizer, CombinedFeaturizer
 from scipy.stats import spearmanr
 from data_loader import get_dataset_loaders
 from utils.common import normalize_gcdc_sub_corpus
@@ -35,11 +35,24 @@ def get_allowed_operations():
         "gcdc": {
             "tasks" : ['3-way-classification', 'minority-classification', 'sentence-ordering', 'sentence-score-prediction'],
             "sub_corpus" : ['All', 'Clinton', 'Enron', 'Yelp', 'Yahoo'],
-        }
+        },
+    "danish":{
+             "tasks" : ["sentence-ordering","3-way-classification"],
+   
+    }
     }
     return dataset_options
 
 #allow deterministic psuedo-random-initialization
+def random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 class TexClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
@@ -112,6 +125,13 @@ class ModelWrapper(pl.LightningModule):
         elif self.config_args.task == "sentence-score-prediction":
             self.task_head = SentenceScorer(self.doc_encoder.tf2.config.hidden_size, args.dropout_rate)
         
+        # handling the multi-task learning approach
+        if self.config_args.arch in ['mtl', 'combined']:
+            # adding textual entailment task head
+            self.te_task_head = TexClassificationHead(self.doc_encoder.tf2.config.hidden_size, 2, args.dropout_rate)
+            # adding accuracy metrics as well 
+            self.te_train_metric = pl.metrics.Accuracy()
+            self.te_val_metric = pl.metrics.Accuracy()
 
     def _get_task_specific_dataset_index(self, dataset_ids):
         entailment_data_idx = []
@@ -129,7 +149,22 @@ class ModelWrapper(pl.LightningModule):
         # dummy indicator (when MTL is inactive) variable for task specific data instances
         task_specific_data_idx = [i for i in range(input_data[0].shape[0])]
 
-       
+        if self.config_args.arch in ['mtl', 'combined']:
+            # gather textual entailment dataset i.e. d_id == 0
+            d_ids = input_data[0]             
+            entailment_data_idx, task_specific_data_idx = self._get_task_specific_dataset_index(d_ids)
+            if len(entailment_data_idx):
+                entailment_data = [z for z in map(lambda x: x[entailment_data_idx], input_data[1:])]
+                # caution : need to change below code "entailment_data[:2]" according to the transformers model used for Multi-task-learning
+                # presently it's set to work with vanilla transformer model when 'mtl' is active.
+                if self.config_args.arch=='mtl' and self.config_args.mtl_base_arch in ['vanilla', 'hierarchical']:
+                    entailment_doc_rep = self.doc_encoder(entailment_data[:2])
+                else:
+                    entailment_doc_rep = self.doc_encoder(entailment_data[:5])
+                output_logits.append(self.te_task_head(entailment_doc_rep))    
+            # assigning the task_specific_data to input_data variable for normal flow
+            input_data = [z for z in map(lambda x: x[task_specific_data_idx], input_data[1:])]
+        
         if len(task_specific_data_idx):
             if self.config_args.task == "sentence-ordering":
                 assert len(input_data)%2 == 0
@@ -193,6 +228,24 @@ class ModelWrapper(pl.LightningModule):
             else:
                 step_metric = self.test_metric
 
+        # architecture specific (MTL) loss calculation
+        if self.config_args.arch in ["mtl", "combined"] and step_type != "test":
+            d_ids = input_data[0]
+            entailment_data_idx, task_specific_data_idx = self._get_task_specific_dataset_index(d_ids)
+            if len(entailment_data_idx):
+                te_pred = model_outputs[0]
+                entailment_label_ids = label_ids[entailment_data_idx].long()
+                te_loss = F.cross_entropy(te_pred, entailment_label_ids)
+                te_step_metric = getattr(self, "te_%s_metric"%step_type)
+                te_acc = te_step_metric(te_pred.softmax(dim=-1), entailment_label_ids)
+                pbar['batch_%s_te_acc'%step_type] = te_acc
+                online_logger_data.update({'batch_%s_te_loss' % step_type: te_loss })
+                loss += te_loss
+                res["%s_te_loss" % step_type] = te_loss
+            online_logger_data.update({"te_data_count": len(entailment_data_idx),
+                                       "task_data_count": len(task_specific_data_idx)})
+            # assigning the task_specific_labels to label_ids variable for normal flow
+            label_ids = label_ids[task_specific_data_idx]
 
         if len(task_specific_data_idx):
             # task specific loss calculation
@@ -241,8 +294,8 @@ class ModelWrapper(pl.LightningModule):
                 task_loss = F.mse_loss(model_output.view(-1), label_ids.view(-1))
                 res.update({'preds': model_output, 'labels': label_ids})
             
-            # if self.config_args.arch in ["mtl", "combined"] and step_type != "test":
-            #     online_logger_data.update({'batch_%s_task_loss' % step_type: task_loss})
+            if self.config_args.arch in ["mtl", "combined"] and step_type != "test":
+                online_logger_data.update({'batch_%s_task_loss' % step_type: task_loss})
         
         loss += task_loss
         online_logger_data.update(pbar)
@@ -286,6 +339,16 @@ class ModelWrapper(pl.LightningModule):
             self.config_args.logger.info('epoch : %d - average_%s_loss : %f, overall_%s_acc : %f' % (self.current_epoch, end_type, avg_loss.item(), 
                                                                                                 end_type, overall_acc.item()))
 
+        # architecture specific (MTL) loss calculation
+        if self.config_args.arch in ["mtl", "combined"] and end_type !='test':
+            te_loss_label = "%s_te_loss"%end_type
+            filtered_te_datapoints =  [x[te_loss_label] for x in step_outputs if te_loss_label in x]
+            if len(filtered_te_datapoints):
+                avg_te_loss = torch.tensor(filtered_te_datapoints).mean()
+                overall_te_acc = getattr(self, "te_%s_metric"%end_type).compute()
+                self.config_args.logger.info('epoch : %d - average_%s_te_loss : %f, overall_%s_te_acc : %f' % (self.current_epoch, end_type, avg_te_loss.item(), 
+                                                                                                    end_type, overall_te_acc.item()))
+                self.logger.log_metrics({'avg_%s_te_loss'%end_type: avg_te_loss, '%s_te_acc'%end_type: overall_te_acc})
 
         # logging to weight and bias if online mode is enabled
         self.logger.log_metrics({'avg_%s_loss'%end_type: avg_loss, '%s_acc'%end_type: overall_acc})
@@ -350,7 +413,7 @@ def start_training(args):
     model = ModelWrapper(args)
     
     args.logger.debug(model)
-    # args.logger.info('Model has %d trainable parameters' % count_parameters(model))
+    args.logger.info('Model has %d trainable parameters' % count_parameters(model))
 
     callback_list = []
     
@@ -427,6 +490,11 @@ def check_config(config):
         config.logger.warn('changing number of GPUs from %d to 1.' % config.gpus)
         config.gpus = 1
     
+    if config.arch in ["mtl", 'combined'] and config.gpus != 1:
+        # TODO: support fpr mutiple-GPU training for MTL and combined architecture. Currently, only single GPU training
+        # is supported for theese architectures.
+        config.logger.warn('[%s] changing number of GPUs from %d to 1.' % (config.arch, config.gpus))
+        config.gpus = 1
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -462,11 +530,11 @@ if __name__ == "__main__":
     parser.add_argument("--margin", default=1.0, type=float,
                         help="margin to use in pairwise sentence ranking loss.")
     # dataset related configurations
-    parser.add_argument('--corpus', choices=['wsj', 'gcdc'], type=str, default='gcdc',
+    parser.add_argument('--corpus', choices=['wsj', 'gcdc','danish'], type=str, default='gcdc',
                         help="specify the corpus.")
     parser.add_argument('--sub_corpus', type=str, default='all',
                         help="specify the sub-corpus for the gcdc dataset.")
-    # # if "allenai/longformer-base-4096" used then pass 2048 as max_seq_len
+    # if "allenai/longformer-base-4096" used then pass 2048 as max_seq_len
     parser.add_argument('--max_seq_len', type=int, default=512,
                         help="specify the maximum sequence length for processed dataset. \
                             if set to -1 then maximum length is obtained from corpus.")
@@ -490,28 +558,28 @@ if __name__ == "__main__":
     # TODO: complete implementation of below parameter
     parser.add_argument('--inverse_pra', default=0, type=int,
                         help="enables inverse pairwise ranking accuracy at inference for sentence-ordering tasks.")
-    # # task related configuration
+    # task related configuration
     parser.add_argument('--task', type=str, required=True,
                         help="specify the task to be performed on the selected dataset.")
     parser.add_argument('--enable_kldiv', action='store_true',
                         help="if gcdc corpus is selected, then use KL divergence loss instead of Cross entropy loss for \
-                             3-way-classification and minority-classification.")
+                            3-way-classification and minority-classification.")
     parser.add_argument('--label_smoothing', type=float, default=0.1,
                         help="lable smoothing for kl divergence loss.")
     # inference
     parser.add_argument('-i', '--inference', action='store_true',
                         help='enable inference over the datasets')
     # logger configs
-    # parser.add_argument('--online_mode', default=0, type=int,
-    #                     help='disables weight and bias syncronization if 0 is passed')
+    parser.add_argument('--online_mode', default=0, type=int,
+                        help='disables weight and bias syncronization if 0 is passed')
     parser.add_argument('--logger_exp_name', type=str, 
                         help='specified name will be used to store checkpoints.')
     # transformer config
     parser.add_argument('--arch', type=str, choices = [x for x in architecture_func], required=True,
                         help='specify type of architecture')
     # if "combined" architecture is active, we can disable mtl (on textual entailment data) associated with it
-    # parser.add_argument('--disable_mtl', type=int, default=0,
-    #                     help='disable training on textual entailment dataset if set to greater than zero.')
+    parser.add_argument('--disable_mtl', type=int, default=0,
+                        help='disable training on textual entailment dataset if set to greater than zero.')
     parser.add_argument('--mtl_base_arch', type=str, default='vanilla', choices=['vanilla', 'hierarchical', 'fact-aware'],
                         help='specify the base architecture to be used with mtl approach.')
     parser.add_argument('--model_name', type=str, default='roberta-base',
@@ -536,9 +604,8 @@ if __name__ == "__main__":
     # featurizer = WSJFeaturizer 
     # featurizer(args).featurize_dataset(inference=args.inference)
     full_arch_name = args.arch
-    # if args.arch=='mtl':
-    #     full_arch_name="%s-%s"%(args.arch, args.mtl_base_arch)
-    
+    if args.arch=='mtl':
+        full_arch_name="%s-%s"%(args.arch, args.mtl_base_arch)
     if not args.logger_exp_name:
         corpus_name = args.corpus
         if args.corpus.lower()=='gcdc':
@@ -560,8 +627,26 @@ if __name__ == "__main__":
     check_config(args)
     # featurize the task specific dataset for selected corpus only one time
     if rank_zero_only.rank == 0:
-        featurizer = GCDCFeaturizer if args.corpus == 'gcdc' else WSJFeaturizer
+        # this will enforce to run preprocessing step during the process start on zeroth GPU and store it to common location.
+        # It can be later loaded at each GPU in multi-gpu settings
+       # featurizer = GCDCFeaturizer if args.corpus == 'gcdc' else WSJFeaturizer
+        featurizer=None
+        if args.corpus == 'gcdc':
+            featurizer = GCDCFeaturizer 
+        elif args.corpus=="danish":
+            featurizer=DanishFeautrizer
+        else:
+            featurizer=WSJFeaturizer
+
         featurizer(args).featurize_dataset(inference=args.inference)
+        # merge textual entailment dataset if architecture is MTL
+        if args.arch=='mtl':
+            mtl_featurizer = MTLFeaturizer(args)
+            mtl_featurizer.featurize_dataset(inference=args.inference)
+        
+        if args.arch=='combined':
+            combined_featurizer = CombinedFeaturizer(args)
+            combined_featurizer.featurize_dataset(inference=args.inference)
     
     dataset_count(args)
     
@@ -585,8 +670,8 @@ if __name__ == "__main__":
             'name': args.logger_exp_name+'-test',
             })
     # turn off the online sync
-    # if args.online_mode==0:
-    logger_args.update({'offline': True}),
+    if args.online_mode==0:
+        logger_args.update({'offline': True}),
     
     # configure and add logger to arguments
     args.online_logger = WandbLogger(**logger_args)
@@ -600,7 +685,6 @@ if __name__ == "__main__":
     args.logger.info('--'*30)
 
     if args.inference:
-        init_testing(args)
+       init_testing(args)
     else:
-        start_training(args)
-# packaging==21.3
+       start_training(args)
