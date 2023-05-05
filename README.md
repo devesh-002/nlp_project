@@ -17,7 +17,10 @@ The metrics are as follows:
 ```
 bash try.sh
 ```
+
+```
 python3 main.py --arch <arch_name> --corpus <corpus_name>   --task <task_name>
+```
 
 For evaluating on datasets, do the following:
 
