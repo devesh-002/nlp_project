@@ -15,15 +15,20 @@ The metrics are as follows:
 - `model_name` defines transformer model to use. (by-default its's roberta-base)
 
 ```
-bash run.sh
+bash try.sh
 ```
+python3 main.py --arch <arch_name> --corpus <corpus_name>   --task <task_name>
 
 For evaluating on datasets, do the following:
 
 ```
-bash eval.sh
+bash infer.sh
 ```
+To make changes in inferences:
+```
+python3 main.py --sub_corpus <name if gcdc> --inference --arch <arch_name>  --corpus <dataset_name>  --freeze_emb_layer  --task <task_name>  --checkpoint_path <saved_checkpoint_path>
 
+```
 We also have submitted the model [here](https://iiitaphyd-my.sharepoint.com/:f:/g/personal/devesh_marwah_research_iiit_ac_in/EojD7orR1MVCkRrnJyuW6qMBhlWvWWeWaDz6bIop9_5VSA?e=UZmOAc) 
 
 The current model is pretrained on vanilla transformer on sentence ordering task for vanilla transformers.
